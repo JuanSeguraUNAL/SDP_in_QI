@@ -1,0 +1,17 @@
+.vscode/
+.venv/
+graphics/
+images/
+*.tex
+*.aux
+*.log
+*.nav
+*.out
+*.snm
+*.synctex.gz
+*.toc
+*.fls
+*.synctex
+*.txt
+*.sty
+*.bib
