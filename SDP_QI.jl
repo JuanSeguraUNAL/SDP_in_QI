@@ -2,6 +2,8 @@ using JuMP
 using SCS
 using LinearAlgebra
 using Clarabel
+using CSV
+using DataFrames
 
 # Solver
 const SOLVER = SCS.Optimizer
@@ -502,7 +504,7 @@ function RRE_PPT_k(ρ_AB::AbstractMatrix, dA::Int, dB::Int, k::Int)
     return r_val, value.(ρ_ext) / (1 + r_val)
 end
 
-#= # Random Robustness of Measurement Incompatibility
+# Random Robustness of Measurement Incompatibility
 function RRMI(M_list::Vector{<:Vector})
     m         = length(M_list)
     o         = length(M_list[1])
@@ -513,23 +515,86 @@ function RRMI(M_list::Vector{<:Vector})
     N_vars = [@variable(model, [1:d, 1:d] in HermitianPSDCone()) for _ in 1:num_parent]
     @variable(model, r >= 0)
 
-    # outcome(k, x): outcome del x-ésimo instrumento para el k-ésimo outcome conjunto
+    # outcome(k, x): outcome of the x instrument for the k outcome set
     outcome(k, x) = (k ÷ o^(m - x - 1)) % o
 
     for x in 0:m-1, a in 0:o-1
         sum_terms = sum(N_vars[k+1] for k in 0:num_parent-1 if outcome(k, x) == a)
         @constraint(model,
-            M_list[x+1][a+1] + r * Matrix{ComplexF64}(I, d, d) / o .== sum_terms)
+            M_list[x+1][a+1] + r * Matrix{ComplexF64}(I, d, d) * tr(M_list[x+1][a+1]) / o .== sum_terms)
     end
     @constraint(model,
         sum(N_vars) .== (1 + r) * Matrix{ComplexF64}(I, d, d))
 
     @objective(model, Min, r)
     optimize!(model)
-    return value(r)
-end =#
 
-# Random Robustness of Measurement Incompatibility (Stable implementation)
+    return value(r)
+end
+
+# Noise Robustness
+function NoiseRobustness(M_list::Vector{<:Vector})
+    m          = length(M_list)
+    o          = length(M_list[1])
+    d          = size(M_list[1][1], 1)
+    num_parent = o^m
+
+    model = Model(SOLVER); set_silent(model)
+    G_vars = [@variable(model, [1:d, 1:d] in HermitianPSDCone()) for _ in 1:num_parent]
+    
+    @variable(model, n >= 0)                    
+    @constraint(model, n <= 1)                 
+
+    outcome(k, x) = (k ÷ o^(m - x - 1)) % o
+    @constraint(model, sum(G_vars) .== Matrix{ComplexF64}(I, d, d))
+
+    for x in 0:m-1, a in 0:o-1
+        sum_terms = sum(G_vars[k+1] for k in 0:num_parent-1 if outcome(k, x) == a)
+        @constraint(model,
+            n * M_list[x+1][a+1] + (1 - n) * tr(M_list[x+1][a+1]) * 
+            Matrix{ComplexF64}(I, d, d) / d .== sum_terms)
+    end
+
+    @objective(model, Max, n)
+    optimize!(model)
+
+    return value(n)
+end
+
+# Dual Noise Robustness
+function NoiseRobustness_dual(M_list::Vector{<:Vector})
+    m = length(M_list)
+    o = length(M_list[1])
+    d = size(M_list[1][1], 1)
+    num_parent = o^m
+
+    model = Model(SOLVER); set_silent(model)
+
+    X_vars = [[(@variable(model, [1:d, 1:d], Hermitian)) for a in 1:o] for x in 1:m]
+
+    outcome(k, x) = (k ÷ o^(m - x - 1)) % o
+
+    lhs = 1 + sum(real(tr(X_vars[x][a] * M_list[x][a])) for x in 1:m, a in 1:o)
+    rhs = (1/d) * sum(real(tr(M_list[x][a])) * real(tr(X_vars[x][a])) for x in 1:m, a in 1:o)
+    @constraint(model, lhs >= rhs)
+
+    for k in 0:num_parent-1
+        sum_terms = sum(X_vars[x+1][outcome(k, x)+1] for x in 0:m-1)
+        @constraint(model, sum_terms in HermitianPSDCone())
+    end
+
+    @objective(model, Min, lhs)
+    optimize!(model)
+
+    status = termination_status(model)
+    if status ∉ (MOI.OPTIMAL, MOI.ALMOST_OPTIMAL)
+        @warn "NoiseRobustness_dual: solver status $status"
+    end
+
+    return objective_value(model)
+end
+
+#= # Random Robustness of Measurement Incompatibility (Stable implementation)
 function RRMI(M_list::Vector{<:Vector})
     m          = length(M_list)
     o          = length(M_list[1])
@@ -621,7 +686,7 @@ function RRMI(M_list::Vector{<:Vector})
         @warn "RRMI: solver status $status"
     end
     return value(r)
-end
+end =#
 
 
 # Auxiliary function for JuMP to calculate P(A_a = B_b + k) = ∑_{j=0}^{d-1} Tr(ρ Π_{j|a} ⊗ Π_{j+k mod d|b})
@@ -668,5 +733,61 @@ function CGLMP_opt(Proj_A::Vector, Proj_B::Vector, d::Int)
     optimize!(model)
     
     return objective_value(model), value.(ρ)
+end
+
+# Optimize the CGLMP inequality fixing a tunning measurement and save data
+function CGLMP_analysis(d::Int)
+    Alphas = LinRange(0, 1, 100)
+    n = length(Alphas)
+    Id_array   = zeros(Float64, n)
+    Entanglement = zeros(Float64, n)
+    NoiseDual  = zeros(Float64, n)
+
+    Threads.@threads for i in 1:n
+        α = Alphas[i]
+        M = tunning_M(d, α)
+
+        Proj_A1 = [begin
+            A1j = zeros(ComplexF64, d, d)
+            A1j[j, j] = 1.0
+            A1j
+        end for j in 1:d]
+
+        Proj_A2 = [begin
+            ket = zeros(ComplexF64, d)
+            ket[j] = 1.0
+            ψ = M * ket
+            ψ = ψ / norm(ψ)
+            ψ * ψ'
+        end for j in 1:d]
+
+        Proj_A = [Proj_A1, Proj_A2]
+        Proj_B = [Proj_A1, Proj_A2]
+
+        Id_max, ρ = CGLMP_opt(Proj_A, Proj_B, d)
+
+        Id_array[i]    = Id_max
+        r = RRE_PPT(ρ, d, d)
+        Entanglement[i] = r / (1 + r)
+        NoiseDual[i]   = NoiseRobustness_dual(Proj_A)
+
+        println("Terminated process for α = $(round(α, digits=4))")
+    end
+
+    # Create the directory in case it doesn't exist
+    mkpath("resultsCGLMP")
+
+    # Save as CSV
+    df = DataFrame(
+        alpha         = collect(Alphas),
+        CGLMP         = Id_array,
+        Entanglement  = Entanglement,
+        NoiseDual = NoiseDual,
+    )
+
+    path = "resultsCGLMP/cglmp_d$(d).csv"
+    CSV.write(path, df)
+
+    return df
 end
 
