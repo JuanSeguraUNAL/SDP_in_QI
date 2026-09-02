@@ -4,6 +4,9 @@ using LinearAlgebra
 using Clarabel
 using CSV
 using DataFrames
+using Statistics
+using CairoMakie
+using LaTeXStrings
 
 # Solver
 const SOLVER = SCS.Optimizer
@@ -66,7 +69,7 @@ function F_operator(d::Int)
         end
     end
 
-    F = F / sqrt(d)
+    return F = F / sqrt(d)
 end
 
 # Tunning Measurements
@@ -74,12 +77,11 @@ function tunning_M(d::Int, α::Float64)
     F = F_operator(d)
     X = X_operator(d)
 
-    # Usar schur en lugar de eigen: garantiza Q unitaria
     SF = schur(F)
     SX = schur(X)
 
-    λ_F = SF.values   # autovalores en la forma de Schur diagonal
-    Q_F = SF.vectors  # unitaria garantizada
+    λ_F = SF.values 
+    Q_F = SF.vectors
 
     λ_X = SX.values
     Q_X = SX.vectors
@@ -113,13 +115,13 @@ function CGLMP_exp(ρ, Proj_A::Vector, Proj_B::Vector, d::Int)
         weight = (1 - 2*k/(d-1))
 
         # Positive terms
-        Positive = prob_eq_mod(ρ, Proj_A[1], Proj_B[1], k, d)
+        Positive  = prob_eq_mod(ρ, Proj_A[1], Proj_B[1], k, d)
         Positive += prob_eq_mod(ρ, Proj_A[2], Proj_B[1], -k-1, d)
         Positive += prob_eq_mod(ρ, Proj_A[2], Proj_B[2], k, d)
         Positive += prob_eq_mod(ρ, Proj_A[1], Proj_B[2], -k, d)
 
         # Negative terms
-        Negative = prob_eq_mod(ρ, Proj_A[1], Proj_B[1], -k-1, d)
+        Negative  = prob_eq_mod(ρ, Proj_A[1], Proj_B[1], -k-1, d)
         Negative += prob_eq_mod(ρ, Proj_A[2], Proj_B[1], k, d)
         Negative += prob_eq_mod(ρ, Proj_A[2], Proj_B[2], -k-1, d)
         Negative += prob_eq_mod(ρ, Proj_A[1], Proj_B[2], k+1, d)
@@ -157,7 +159,7 @@ function partial_trace(σ, dims::Vector{Int}, traced_sys)
     return result
 end
 
-# Given a state ρ_{A B₁ B₂ … Bₖ}, trace over all subsystems B₂,…,Bₖ, returning ρ_{A B₁}
+# Given a state ρ_{A B₁ B₂ … Bₖ}, trace over all subsystems B₂,…,Bₖ, returning ρ_{A B₁} 
 function partial_trace_Bsystems(ρ, dA::Int, dB::Int, k::Int)
     ρ_red = ρ
     dims  = [dA; fill(dB, k)]
@@ -221,6 +223,30 @@ function permutation_operator(dA::Int, dB::Int, k::Int, i::Int, j::Int)
         P[idx_perm+1, idx+1] = 1.0
     end
     return P
+end
+
+# Schatten p-norm
+function SchattenNorm(A::AbstractMatrix, p::Float64)
+    A_svd = svd(A)           # Singular value decomposition
+    svd_vals = A_svd.S           # Take the vector of singular values
+
+    return norm(svd_vals, p)
+end
+
+# von Neumann entropy
+function VN_entropy(ρ::AbstractMatrix)
+    λ = real.(eigen(ρ).values)
+    λ = λ[λ .> 1e-10]
+    return -sum(λ .* log.(λ))
+end
+
+# Entanglement entropy (pure states)
+function Ent_entropy(ρ::AbstractMatrix, dA::Int, dB::Int)
+    d = size(ρ, 1)
+    @assert d == dA * dB "Dimensions don't match"
+    ρ_A = partial_trace(ρ, [dA, dB], 1)
+
+    return VN_entropy(ρ_A)
 end
 
 # =============================================================================
@@ -414,7 +440,26 @@ function GRMI(Measurements::Vector)
     return objective_value(model) - 1
 end
 
-# Calculate the negativity of entanglement and find an entanglement witness
+# Negativity of entanglement (primal)
+function Negativity(ρ::AbstractMatrix, dA::Int, dB::Int)
+    d = dA * dB
+    @assert size(ρ) == (d, d)
+
+    model = Model(SOLVER); set_silent(model)
+    @variable(model, Y[1:d, 1:d], Hermitian)
+    @variable(model, Z[1:d, 1:d], Hermitian)
+
+    ρ_TA = partial_transpose_A(ρ, dA, dB)
+
+    @constraint(model, LinearAlgebra.Hermitian(Y) in HermitianPSDCone())
+    @constraint(model, LinearAlgebra.Hermitian(Z) in HermitianPSDCone())
+    @constraint(model, ρ_TA == Z - Y)
+    @objective(model, Min, real(tr(Y)))
+    optimize!(model)
+    return objective_value(model)
+end
+
+# Calculate the negativity of entanglement and find an entanglement witness (dual)
 function entanglement_witness(ρ::AbstractMatrix, dA::Int, dB::Int)
     d = dA * dB
     @assert size(ρ) == (d, d)
@@ -422,12 +467,11 @@ function entanglement_witness(ρ::AbstractMatrix, dA::Int, dB::Int)
     model = Model(SOLVER); set_silent(model)
     @variable(model, W[1:d, 1:d], Hermitian)
 
-    # Partial transpose over A
     W_TA = partial_transpose_A(W, dA, dB)
     I_d  = Matrix{ComplexF64}(I, d, d)
 
-    @constraint(model, I_d - W_TA in HermitianPSDCone())
-    @constraint(model, W_TA       in HermitianPSDCone())
+    @constraint(model, LinearAlgebra.Hermitian(I_d - W_TA) in HermitianPSDCone())
+    @constraint(model, LinearAlgebra.Hermitian(W_TA)       in HermitianPSDCone())
     @objective(model, Max, -real(tr(W * ρ)))
     optimize!(model)
     return objective_value(model), value.(W)
@@ -594,100 +638,22 @@ function NoiseRobustness_dual(M_list::Vector{<:Vector})
     return objective_value(model)
 end
 
-#= # Random Robustness of Measurement Incompatibility (Stable implementation)
-function RRMI(M_list::Vector{<:Vector})
-    m          = length(M_list)
-    o          = length(M_list[1])
-    d          = size(M_list[1][1], 1)
-    num_parent = o^m
-
-    M_clean = map(M_list) do M
-        S    = Hermitian(sum(M))
-        corr = (S - I(d)) / length(M)
-        [Hermitian(m_ax - corr) for m_ax in M]
+# Measurement Incompatibility based on Non-Commutativity
+function MI_NC(E::AbstractVector{<:AbstractMatrix}, F::AbstractVector{<:AbstractMatrix}, p::Float64)
+    dE = size(E[1], 1)      # Dimension of the measurement operators of E
+    dF = size(F[1], 1)      # Dimension of the measurement operators of F
+    nE = length(E)          # Number of outcomes of the measurement E
+    nF = length(F)          # Number of outcomes of the measurement F
+    @assert dE == dF "The dimension of the measurements E and F must be the same"
+    
+    Incomp = 0.
+    for a in 1:nE, b in 1:nF
+        commutator = E[a] * F[b] - F[b] * E[a]
+        Incomp += SchattenNorm(commutator, p)
     end
 
-    model = Model(Clarabel.Optimizer)
-    set_silent(model)
-    set_attribute(model, "tol_gap_abs", 1e-9)
-    set_attribute(model, "tol_gap_rel", 1e-9)
-    set_attribute(model, "tol_feas",    1e-9)
-    set_attribute(model, "max_iter",    200000)
-
-    @variable(model, r >= 0)
-
-    sym_idx  = [(i,j) for i in 1:d for j in i:d]
-    asym_idx = [(i,j) for i in 1:d for j in i+1:d]
-    n_sym    = length(sym_idx)
-    n_asym   = length(asym_idx)
-
-    av = [@variable(model, [1:n_sym])  for _ in 1:num_parent]
-    bv = [@variable(model, [1:n_asym]) for _ in 1:num_parent]
-
-    for λ in 1:num_parent
-        R = [AffExpr(0) for _ in 1:2d, _ in 1:2d]
-
-        for (k,(i,j)) in enumerate(sym_idx)
-            if i == j
-                R[i,    i   ] = av[λ][k]
-                R[d+i,  d+i ] = av[λ][k]
-            else
-                R[i,  j  ] = av[λ][k];   R[j,  i  ] = av[λ][k]
-                R[d+i,d+j] = av[λ][k];   R[d+j,d+i] = av[λ][k]
-            end
-        end
-
-        for (k,(i,j)) in enumerate(asym_idx)
-            R[i,   d+j] = -bv[λ][k];   R[j,   d+i] =  bv[λ][k]
-            R[d+i, j  ] =  bv[λ][k];   R[d+j, i  ] = -bv[λ][k]
-        end
-
-        @constraint(model, R in PSDCone())
-    end
-
-    outcome(λ0, x) = (λ0 ÷ o^(m - x - 1)) % o
-
-    for (k,(i,j)) in enumerate(sym_idx)
-        s = sum(av[λ][k] for λ in 1:num_parent)
-        if i == j
-            @constraint(model, s == 1 + r)
-        else
-            @constraint(model, s == 0)
-        end
-    end
-    for k in 1:n_asym
-        @constraint(model, sum(bv[λ][k] for λ in 1:num_parent) == 0)
-    end
-
-    for x in 0:m-1, a_out in 0:o-1
-        M_ax  = M_clean[x+1][a_out+1]
-        ReM   = real.(Matrix(M_ax))
-        ImM   = imag.(Matrix(M_ax))
-        group = [λ for λ in 1:num_parent if outcome(λ-1, x) == a_out]
-
-        for (k,(i,j)) in enumerate(sym_idx)
-            s = sum(av[λ][k] for λ in group)
-            if i == j
-                @constraint(model, s == ReM[i,i] + r/o)
-            else
-                @constraint(model, s == ReM[i,j])
-            end
-        end
-        for (k,(i,j)) in enumerate(asym_idx)
-            @constraint(model, sum(bv[λ][k] for λ in group) == ImM[i,j])
-        end
-    end
-
-    @objective(model, Min, r)
-    optimize!(model)
-
-    status = termination_status(model)
-    if status ∉ (MOI.OPTIMAL, MOI.ALMOST_OPTIMAL)
-        @warn "RRMI: solver status $status"
-    end
-    return value(r)
-end =#
-
+    return Incomp
+end
 
 # Auxiliary function for JuMP to calculate P(A_a = B_b + k) = ∑_{j=0}^{d-1} Tr(ρ Π_{j|a} ⊗ Π_{j+k mod d|b})
 function prob_juMP_expr(ρ, Proj_Aa::Vector, Proj_Bb::Vector, k::Int, d::Int)
@@ -737,11 +703,16 @@ end
 
 # Optimize the CGLMP inequality fixing a tunning measurement and save data
 function CGLMP_analysis(d::Int)
-    Alphas = LinRange(0, 1, 100)
-    n = length(Alphas)
-    Id_array   = zeros(Float64, n)
+    Alphas       = LinRange(0, 1, 100)
+    n            = length(Alphas)
+    Id_array     = zeros(Float64, n)
     Entanglement = zeros(Float64, n)
-    NoiseDual  = zeros(Float64, n)
+    Neg_primal   = zeros(Float64, n)
+    Neg_dual     = zeros(Float64, n)
+    NoiseDual    = zeros(Float64, n)
+    Incomp_NC    = zeros(Float64, n)
+    vn_entropy   = zeros(Float64, n)
+    ent_entropy  = zeros(Float64, n)
 
     Threads.@threads for i in 1:n
         α = Alphas[i]
@@ -766,10 +737,15 @@ function CGLMP_analysis(d::Int)
 
         Id_max, ρ = CGLMP_opt(Proj_A, Proj_B, d)
 
-        Id_array[i]    = Id_max
-        r = RRE_PPT(ρ, d, d)
-        Entanglement[i] = r / (1 + r)
-        NoiseDual[i]   = NoiseRobustness_dual(Proj_A)
+        Id_array[i]      = Id_max
+        r                = RRE_PPT(ρ, d, d)
+        Entanglement[i]  = r / (1 + r)
+        NoiseDual[i]     = NoiseRobustness_dual(Proj_A)
+        Incomp_NC[i]     = MI_NC(Proj_A1, Proj_A2, 2.)
+        Neg_primal[i], _ = entanglement_witness(ρ, d, d)
+        Neg_dual[i]      = Negativity(ρ, d, d)
+        vn_entropy[i]    = VN_entropy(ρ)
+        ent_entropy[i]   = Ent_entropy(ρ, d, d)
 
         println("Terminated process for α = $(round(α, digits=4))")
     end
@@ -779,10 +755,15 @@ function CGLMP_analysis(d::Int)
 
     # Save as CSV
     df = DataFrame(
-        alpha         = collect(Alphas),
-        CGLMP         = Id_array,
-        Entanglement  = Entanglement,
-        NoiseDual = NoiseDual,
+        alpha        = collect(Alphas),
+        CGLMP        = Id_array,
+        Entanglement = Entanglement,
+        NoiseDual    = NoiseDual,
+        Incomp_NC    = Incomp_NC,
+        Neg_primal   = Neg_primal,
+        Neg_dual     = Neg_dual,
+        vn_entropy   = vn_entropy,
+        ent_entropy  = ent_entropy
     )
 
     path = "resultsCGLMP/cglmp_d$(d).csv"
@@ -791,3 +772,99 @@ function CGLMP_analysis(d::Int)
     return df
 end
 
+# Optimize the CGLMP inequality fixing a tunning measurement (different for the two parties) and save data
+function CGLMP_analysis_2D(d::Int, npoints=100)
+    Alphas       = collect(LinRange(0, 1, npoints))
+    n            = length(Alphas)
+    total        = n * n
+
+    alpha_A      = zeros(Float64, total)
+    alpha_B      = zeros(Float64, total)
+    Id_array     = zeros(Float64, total)
+    Entanglement = zeros(Float64, total)
+    Neg_primal   = zeros(Float64, total)
+    Neg_dual     = zeros(Float64, total)
+    NoiseDual_A  = zeros(Float64, total)
+    NoiseDual_B  = zeros(Float64, total)
+    Incomp_NC_A  = zeros(Float64, total)
+    Incomp_NC_B  = zeros(Float64, total)
+    vn_entropy   = zeros(Float64, total)
+    ent_entropy  = zeros(Float64, total)
+
+    Threads.@threads for idx in 1:total
+        i  = (idx - 1) ÷ n + 1
+        j  = (idx - 1) % n + 1
+
+        α_A = Alphas[i]
+        α_B = Alphas[j]
+        M_A = tunning_M(d, α_A)
+        M_B = tunning_M(d, α_B)
+
+        Proj_A1 = [begin
+            A1j = zeros(ComplexF64, d, d)
+            A1j[k, k] = 1.0
+            A1j
+        end for k in 1:d]
+
+        Proj_A2 = [begin
+            ket = zeros(ComplexF64, d)
+            ket[k] = 1.0
+            ψ = M_A * ket
+            ψ = ψ / norm(ψ)
+            ψ * ψ'
+        end for k in 1:d]
+
+        Proj_B1 = Proj_A1
+
+        Proj_B2 = [begin
+            ket = zeros(ComplexF64, d)
+            ket[k] = 1.0
+            ψ = M_B * ket
+            ψ = ψ / norm(ψ)
+            ψ * ψ'
+        end for k in 1:d]
+
+        Proj_A = [Proj_A1, Proj_A2]
+        Proj_B = [Proj_B1, Proj_B2]
+
+        Id_max, ρ = CGLMP_opt(Proj_A, Proj_B, d)
+
+        Id_array[idx]      = Id_max
+        r                  = RRE_PPT(ρ, d, d)
+        Entanglement[idx]  = r / (1 + r)
+        NoiseDual_A[idx]   = NoiseRobustness_dual(Proj_A)
+        NoiseDual_B[idx]   = NoiseRobustness_dual(Proj_B)
+        Incomp_NC_A[idx]   = MI_NC(Proj_A1, Proj_A2, 2.)
+        Incomp_NC_B[idx]   = MI_NC(Proj_B1, Proj_B2, 2.)
+        Neg_primal[idx], _ = entanglement_witness(ρ, d, d)
+        Neg_dual[idx]      = Negativity(ρ, d, d)
+        vn_entropy[idx]    = VN_entropy(ρ)
+        ent_entropy[idx]   = Ent_entropy(ρ, d, d)
+
+        println("Finished process for α = $(round(α, digits=4))")
+    end
+
+    # Create the directory in case it doesn't exist
+    mkpath("resultsCGLMP")
+
+    # Save as CSV
+    df = DataFrame(
+        alpha_A      = α_A,
+        alpha_B      = α_B,
+        CGLMP        = Id_array,
+        Entanglement = Entanglement,
+        NoiseDual_A  = NoiseDual_A,
+        NoiseDual_B  = NoiseDual_B,
+        Incomp_NC_A  = Incomp_NC_A,
+        Incomp_NC_B  = Incomp_NC_B,
+        Neg_primal   = Neg_primal,
+        Neg_dual     = Neg_dual,
+        vn_entropy   = vn_entropy,
+        ent_entropy  = ent_entropy
+    )
+
+    path = "resultsCGLMP/cglmp_d$(d).csv"
+    CSV.write(path, df)
+
+    return df
+end
